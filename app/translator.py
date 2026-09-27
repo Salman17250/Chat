@@ -24,15 +24,11 @@ from app.rag.config import DATA_DIR
 TRANSLATION_CACHE_FILE = DATA_DIR / "translation_cache.json"
 
 _TRANSLATION_CACHE: Dict[str, str] = {
-    # Seed common responses for instant 0ms responses
-    "en->gu:His father's name is Senior Jon.": "તેમના પિતાનું નામ સિનિયર જોન છે.",
-    "en->hi:His father's name is Senior Jon.": "उनके पिता का नाम सीनियर जॉन है।",
-    "en->gu:Jon Due is 33 years old.": "જોન ડ્યૂ 33 વર્ષનો છે.",
-    "en->hi:Jon Due is 33 years old.": "जॉन ड्यू 33 साल के हैं।",
-    "en->gu:Jon Due is male and lives at 23 St, Manhattan.": "જોન ડ્યૂ પુરૂષ છે અને 23 સેન્ટ, મેનહટનમાં રહે છે.",
-    "en->hi:Jon Due is male and lives at 23 St, Manhattan.": "जॉन ड्यू पुरुष हैं और 23 सेंट, मैनहट्टन में रहते हैं.",
+    # System message translations for instant responses
     "en->gu:I couldn't find that information in the document.": "મને દસ્તાવેજમાં તે માહિતી મળી નથી.",
     "en->hi:I couldn't find that information in the document.": "मुझे दस्तावेज़ में वह जानकारी नहीं मिली.",
+    "en->gu:Relevant information was not found in the uploaded documents.": "અપલોડ કરેલા દસ્તાવેજોમાં સંબંધિત માહિતી મળી નથી.",
+    "en->hi:Relevant information was not found in the uploaded documents.": "अपलोड किए गए दस्तावेज़ों में संबंधित जानकारी नहीं मिली।",
 }
 
 import threading
@@ -76,6 +72,7 @@ ROMAN_TO_ENGLISH = {
     "banavvu": "create make", "banavva": "create make", "banavvi": "create make", "banavo": "create make",
     "karvu": "do create", "karva": "do create", "karvano": "do enter", "karvani": "do enter",
     "muko": "enter add", "nakhvo": "enter add", "jovu": "see view", "malse": "find get",
+    "pachhi": "after next", "pahela": "before", "thase": "will happen",
 
     # Hindi words (Hinglish)
     "baap": "father", "papa": "father",
@@ -94,7 +91,10 @@ ROMAN_TO_ENGLISH = {
     "dost": "friend", "mitra": "friend", "beta": "son", "beti": "daughter",
     "naam": "name", "vyavsay": "profession", "pata": "address",
     "chahiye": "want need", "tarika": "way method", "tarike": "ways options", "rasta": "way",
-    "dalna": "enter add", "dale": "enter add", "dalein": "enter add"
+    "dalna": "enter add", "dale": "enter add", "dalein": "enter add",
+    "baad": "after next", "pehle": "before", "hota": "happens does", "hogi": "will happen",
+    "hoga": "will happen", "karta": "does", "karti": "does", "karta_hai": "works does",
+    "samjhao": "explain", "samjhao_mujhe": "explain to me", "bata": "tell", "kya": "what"
 }
 
 # Distinct markers
@@ -103,14 +103,15 @@ GUJLISH_DISTINCT = frozenset({
     "kem", "su", "shu", "kone", "maaru", "taaru", "enu", "emnu", "rahe", "rehe",
     "ghare", "dhandho", "dikro", "dikri", "ben", "baa", "pappa", "bapu", "aabhar", "majama",
     "kevi", "rite", "kevirite", "banavvu", "banavva", "banavvi", "karvu", "karva", "karvano", "karvani",
-    "malse", "jovu"
+    "malse", "jovu", "pachhi", "pahela"
 })
 
 HINGLISH_DISTINCT = frozenset({
     "hai", "hain", "kaha", "kidhar", "kaun", "kyun", "kyu", "kaise", "kese", "uska", "uski",
     "uske", "unka", "unki", "unke", "iska", "iski", "iske", "batao", "bataao", "mujhe",
     "bolo", "beta", "beti", "pata", "ghar", "namaste", "namaskar", "dhanyawad", "shukriya",
-    "banaye", "banayein", "banana", "karna", "kare", "karein", "chahiye", "tarika", "tarike"
+    "banaye", "banayein", "banana", "karna", "kare", "karein", "chahiye", "tarika", "tarike",
+    "baad", "pehle", "hota", "hoga", "karta", "samjhao"
 })
 
 
@@ -170,14 +171,14 @@ def fast_pattern_translate(text: str, target_lang: str) -> Optional[str]:
     """
     clean = text.strip()
 
-    # 1. Father pattern: "His father's name is X." or "Father's name is X."
-    m = re.match(r"^(?:(?:His|Her|Their)\s+)?father's\s+name\s+is\s+([^.]+)\.?$", clean, re.I)
+    # 1. Attribute pattern: "[Entity]'s [attribute] is [Value]"
+    m = re.match(r"^([^.]+?)'s\s+([a-zA-Z\s]+?)\s+is\s+([^.]+)\.?$", clean, re.I)
     if m:
-        name = m.group(1).strip()
+        subject, attr, val = m.group(1).strip(), m.group(2).strip().lower(), m.group(3).strip()
         if target_lang == "gu":
-            return f"તેમના પિતાનું નામ {name} છે."
+            return f"{subject}નું {attr} {val} છે."
         elif target_lang == "hi":
-            return f"उनके पिता का नाम {name} है।"
+            return f"{subject} का {attr} {val} है।"
 
     # 2. Age pattern: "X is Y years old."
     m = re.match(r"^([^.]+?)\s+is\s+(\d+)\s+years\s+old\.?$", clean, re.I)

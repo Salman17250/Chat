@@ -35,6 +35,9 @@ class AssembledResponse:
     sources: List[AssembledSource]
     debug_trace: Optional[Dict[str, Any]] = None
     sub_query_coverages: Optional[Dict[str, bool]] = None
+    answer_type: Optional[str] = "explanation"
+    reasoning: Optional[Dict[str, Any]] = None
+    timing_breakdown: Optional[Dict[str, float]] = None
 
 class ContextAssembler:
     """

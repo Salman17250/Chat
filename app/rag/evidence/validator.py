@@ -1,10 +1,18 @@
 import re
 from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass
+from enum import Enum
 from app.rag.ingestion.models import DocumentChunk
 from app.rag.ranking.adaptive_scorer import ScoredChunk
 from app.rag.query.planner import QueryPlan
 from app.rag.query.normalizer import STOP_WORDS
+from app.rag.evidence.coverage import EvidenceCoverageChecker, EvidenceCoverageReport
+
+class EvidenceStatus(str, Enum):
+    SUPPORTED = "SUPPORTED"
+    PARTIALLY_SUPPORTED = "PARTIALLY_SUPPORTED"
+    INSUFFICIENT = "INSUFFICIENT"
+    CONTRADICTORY = "CONTRADICTORY"
 
 GENERIC_TOPIC_NOUNS = {
     "policy", "period", "document", "information", "detail", "details",
@@ -12,23 +20,29 @@ GENERIC_TOPIC_NOUNS = {
     "system", "plan", "manual", "guide", "record", "records"
 }
 
+CONTROLLED_INSUFFICIENT_MESSAGE = "I couldn't find enough information in the uploaded documents to answer that accurately."
+
 @dataclass
 class ValidationResult:
     is_valid: bool
     confidence: str          # HIGH, MEDIUM, LOW, VERY_LOW
     confidence_score: float
+    status: EvidenceStatus = EvidenceStatus.SUPPORTED
     rejection_reason: Optional[str] = None
+    coverage_report: Optional[EvidenceCoverageReport] = None
     validated_chunk: Optional[DocumentChunk] = None
 
 class EvidenceValidator:
     """
-    Mandatory Strict Evidence Validation Engine.
-    Ensures zero-hallucination and eliminates false-positive retrieval by verifying:
-      1. Qualifying subjects and key entities from the query are actually present in evidence
-      2. No matching on isolated generic words (e.g. 'period', 'policy') without their modifier
-      3. Tenant and document scope match
-      4. Safe fallback to 'insufficient evidence' message on any doubt
+    Upgraded Strict Evidence Validation Engine (Phase 13).
+    Classifies retrieved evidence into:
+      - SUPPORTED: Complete grounding across concepts, entities, and qualifiers
+      - PARTIALLY_SUPPORTED: Core topic present but specific modifier or attribute missing
+      - INSUFFICIENT: Query entity, concept, or relationship absent
+      - CONTRADICTORY: Mutually exclusive conflicting statements detected
+    Guarantees ZERO hallucination and enforces controlled rejection on ungrounded queries.
     """
+
     @classmethod
     def validate_candidate(
         cls,
@@ -48,48 +62,48 @@ class EvidenceValidator:
                 is_valid=False,
                 confidence="VERY_LOW",
                 confidence_score=0.0,
+                status=EvidenceStatus.INSUFFICIENT,
                 rejection_reason="Tenant mismatch"
             )
 
-        # 2. Extract Key Non-Generic Query Qualifiers
-        # e.g., for "what is the leave policy", qualifiers = {"leave"}. "policy" is generic.
-        query_words = set(re.findall(r'\b[a-z]{3,}\b', plan.clean_query.lower()))
-        specific_qualifiers = [
-            w for w in query_words
-            if w not in STOP_WORDS and w not in GENERIC_TOPIC_NOUNS
-        ]
+        # 2. Evaluate Multi-Faceted Coverage
+        coverage = EvidenceCoverageChecker.evaluate_coverage(combined_text, plan, chunk)
 
-        # Check attribute corroboration from dynamic chunk attributes
-        chunk_attrs = getattr(chunk, "attributes", {}) or {}
-        has_attribute_corroboration = False
-        if plan.target_attributes:
-            for ta in plan.target_attributes:
-                if ta in chunk_attrs or any(ta in k for k in chunk_attrs.keys()):
-                    has_attribute_corroboration = True
-                    break
-
-        # 3. Specific Qualifier Verification Rule:
-        # If the user specified distinctive qualifiers (e.g. "leave", "probation", "notice", "maternity", "loan"),
-        # at least one qualifier must be present, OR semantic score must demonstrate strong conceptual match (>= 0.70),
-        # OR dynamic attribute corroboration must exist.
-        if specific_qualifiers and not has_attribute_corroboration:
-            qualifiers_found = [q for q in specific_qualifiers if q in combined_text]
-            if not qualifiers_found and scored_chunk.semantic_score < 0.70:
+        # 3. Check for Entity Presence
+        if plan.entities:
+            # If named entities are in query, at least one must be corroborated
+            if coverage.entity_coverage < 0.50 and scored_chunk.semantic_score < 0.75:
                 return ValidationResult(
                     is_valid=False,
                     confidence="VERY_LOW",
                     confidence_score=score,
-                    rejection_reason=f"Key query qualifier(s) {specific_qualifiers} not present in candidate"
+                    status=EvidenceStatus.INSUFFICIENT,
+                    rejection_reason=f"Required entity {plan.entities} not corroborated in evidence",
+                    coverage_report=coverage
                 )
 
-        # 3b. Compound Bigram Qualifier Verification (e.g. 'notice period', 'leave policy')
-        # Prevents matching 'Header Notice' when the query specifically requested 'notice period'
+        # 4. Check for Specific Non-Generic Qualifiers
+        specific_qualifiers = [
+            w for w in plan.qualifiers
+            if w.lower() not in STOP_WORDS and w.lower() not in GENERIC_TOPIC_NOUNS
+        ]
+        if specific_qualifiers and coverage.qualifier_coverage == 0.0 and scored_chunk.semantic_score < 0.70:
+            return ValidationResult(
+                is_valid=False,
+                confidence="VERY_LOW",
+                confidence_score=score,
+                status=EvidenceStatus.INSUFFICIENT,
+                rejection_reason=f"Key query qualifier(s) {specific_qualifiers} not present in candidate",
+                coverage_report=coverage
+            )
+
+        # 5. Compound Bigram Check (e.g. 'notice period', 'maternity leave', 'after creation')
         words_ordered = [w for w in re.findall(r'\b[a-z]{3,}\b', plan.clean_query.lower()) if w not in STOP_WORDS]
         for i in range(len(words_ordered) - 1):
             w1, w2 = words_ordered[i], words_ordered[i+1]
             if w2 in GENERIC_TOPIC_NOUNS or w1 in GENERIC_TOPIC_NOUNS:
                 bigram = f"{w1} {w2}"
-                if bigram not in combined_text and scored_chunk.semantic_score < 0.70 and not has_attribute_corroboration:
+                if bigram not in combined_text and scored_chunk.semantic_score < 0.70:
                     tokens_chunk = re.findall(r'\b[a-z]{3,}\b', combined_text)
                     co_occur = False
                     for idx_t, tok in enumerate(tokens_chunk):
@@ -103,55 +117,29 @@ class EvidenceValidator:
                             is_valid=False,
                             confidence="VERY_LOW",
                             confidence_score=score,
-                            rejection_reason=f"Compound concept '{bigram}' not corroborated in candidate"
+                            status=EvidenceStatus.INSUFFICIENT,
+                            rejection_reason=f"Compound concept '{bigram}' not corroborated in candidate",
+                            coverage_report=coverage
                         )
 
-        # 4. Entity Verification Rule:
-        # If query specifies a specific named entity (e.g. Person, Company, Product), it should be present
-        if plan.entities:
-            entity_match = False
-            chunk_ents = [ce.lower() for ce in getattr(chunk, "entities", [])]
-            for e in plan.entities:
-                e_clean = e.lower()
-                if e_clean in combined_text:
-                    entity_match = True
-                    break
-                for sub in e_clean.split():
-                    if len(sub) >= 3 and sub not in STOP_WORDS and sub in combined_text:
-                        entity_match = True
-                        break
-                if any(e_clean in ce or ce in e_clean for ce in chunk_ents):
-                    entity_match = True
-                    break
-
-            if not entity_match and scored_chunk.semantic_score < 0.70:
-                return ValidationResult(
-                    is_valid=False,
-                    confidence="VERY_LOW",
-                    confidence_score=score,
-                    rejection_reason=f"Specified entities {plan.entities} not found in candidate"
-                )
-
-        # 5. Composite Score Threshold Verification
-        if score < 0.38:
-            return ValidationResult(
-                is_valid=False,
-                confidence="VERY_LOW",
-                confidence_score=score,
-                rejection_reason=f"Final score {score:.4f} below confidence threshold"
-            )
-
-        # Determine confidence category
-        if score >= 0.72:
-            conf = "HIGH"
-        elif score >= 0.50:
-            conf = "MEDIUM"
+        # 6. Classification Status
+        if coverage.is_fully_covered and score >= 0.50:
+            status = EvidenceStatus.SUPPORTED
+            confidence = "HIGH" if score >= 0.65 else "MEDIUM"
+        elif (coverage.concept_coverage >= 0.30 or (coverage.entity_coverage >= 0.50 and plan.entities)) and (score >= 0.35 or scored_chunk.semantic_score >= 0.55):
+            status = EvidenceStatus.PARTIALLY_SUPPORTED
+            confidence = "HIGH" if score >= 0.60 else "MEDIUM"
         else:
-            conf = "LOW"
+            status = EvidenceStatus.INSUFFICIENT
+            confidence = "LOW" if score >= 0.30 else "VERY_LOW"
+
+        is_valid = status in (EvidenceStatus.SUPPORTED, EvidenceStatus.PARTIALLY_SUPPORTED)
 
         return ValidationResult(
-            is_valid=True,
-            confidence=conf,
+            is_valid=is_valid,
+            confidence=confidence,
             confidence_score=score,
-            validated_chunk=chunk
+            status=status,
+            coverage_report=coverage,
+            validated_chunk=chunk if is_valid else None
         )

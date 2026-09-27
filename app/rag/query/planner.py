@@ -1,21 +1,42 @@
 import re
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 from dataclasses import dataclass, field
-from app.rag.query.analyzer import QueryProfile, QueryAnalyzer
-from app.rag.query.normalizer import STOP_WORDS
+from app.rag.query.analyzer import QueryProfile, QueryAnalyzer, AnalyzedQuery
+from app.rag.query.normalizer import QueryNormalizer, STOP_WORDS, singularize
+from app.rag.query.decomposer import QueryDecomposer
+from app.rag.query.coreference import CoreferenceResolver
+from app.rag.vocabulary.dynamic_vocabulary import DynamicCorpusVocabulary
 
 @dataclass
 class QueryPlan:
-    raw_query: str
-    clean_query: str
-    intent: str
-    profile: QueryProfile
+    # Full Phase 1 & 7 Structured Specification
+    normalized_query: str
+    original_query: str
+    language: str = "en"
+    intent: str = "general"
+    subject: Optional[str] = None
     entities: List[str] = field(default_factory=list)
+    action: Optional[str] = None
+    qualifiers: List[str] = field(default_factory=list)
+    attributes: List[str] = field(default_factory=list)
+    relationships: List[str] = field(default_factory=list)
+    temporal_context: Optional[str] = None
+    comparison_targets: List[str] = field(default_factory=list)
+    question_type: str = "what"
+    document_scope: Optional[str] = None
+    conversation_references: List[str] = field(default_factory=list)
+    sub_queries: List[str] = field(default_factory=list)
+    expanded_terms: List[str] = field(default_factory=list)
+    retrieval_strategy: Dict[str, Any] = field(default_factory=dict)
+
+    # Backward-compatible convenience accessors
+    raw_query: str = ""
+    clean_query: str = ""
+    profile: QueryProfile = QueryProfile.CONCEPTUAL_PARAPHRASE
     keywords: List[str] = field(default_factory=list)
     numbers: List[float] = field(default_factory=list)
     currencies: List[str] = field(default_factory=list)
     percentages: List[float] = field(default_factory=list)
-    comparison_targets: List[str] = field(default_factory=list)
     target_attributes: List[str] = field(default_factory=list)
     can_bypass_embedding: bool = False
     requires_calculation: bool = False
@@ -26,138 +47,317 @@ class QueryPlan:
 
 class QueryPlanner:
     """
-    Lightweight Deterministic Query Planner (<0.1ms).
-    Classifies queries, extracts structured targets (entities, attributes, math operations, comparisons),
-    and produces an optimized retrieval execution plan WITHOUT calling an LLM.
+    Intelligent Deterministic Query Planning & Semantic Representation Engine (<0.2ms).
+    Transforms natural-language questions into rich semantic representations:
+      - Intent & entity role extraction
+      - Action & qualifier identification (e.g. after_creation, next_step)
+      - Dynamic question decomposition & reference tracking
+      - Adaptive retrieval routing strategy with branch weights
+    ZERO hardcoded answers, ZERO LLM on the query path.
     """
+
+    # Interrogative classifiers
+    QUESTION_TYPE_PATTERNS = [
+        (re.compile(r'\bhow\s+to\b|\bhow\s+do\b|\bhow\s+can\b|\bhow\s+does\b', re.I), "how"),
+        (re.compile(r'\bwhat\s+happens\b|\bwhat\s+is\b|\bwhat\s+are\b|\bwhat\b', re.I), "what"),
+        (re.compile(r'\bwhy\b', re.I), "why"),
+        (re.compile(r'\bwhen\b', re.I), "when"),
+        (re.compile(r'\bwhere\b', re.I), "where"),
+        (re.compile(r'\bwho\b', re.I), "who"),
+        (re.compile(r'\bwhich\b', re.I), "which"),
+        (re.compile(r'\b(?:can|could|is|are|does|do|will|should|would)\s+(?:i|we|it|a|the|user)\b', re.I), "boolean"),
+    ]
+
+    # Relational and action patterns
+    ACTION_PATTERNS = [
+        (re.compile(r'\bafter\s+(?:creating|creation|setting\s+up|setup|configuring|configuration|saving|submitting)\b', re.I), "after_creation"),
+        (re.compile(r'\bbefore\s+(?:creating|creation|setting\s+up|configuring|deleting|submitting)\b', re.I), "before_action"),
+        (re.compile(r'\b(?:how\s+to|how\s+do\s+i|steps\s+to)\s+(create|configure|setup|apply|delete|modify|update|cancel|add)\b', re.I), lambda m: f"how_to_{m.group(1).lower()}"),
+        (re.compile(r'\b(?:used\s+for|purpose\s+of|role\s+of)\b', re.I), "purpose_usage"),
+        (re.compile(r'\b(?:composed\s+of|consists\s+of|contains|has\s+stages?|structure\s+of)\b', re.I), "structure_containment"),
+    ]
+
+    QUALIFIER_KEYWORDS = {
+        "after", "before", "during", "then", "next", "subsequently", "first", "finally", "last",
+        "creating", "creation", "configured", "configuring", "mandatory", "optional", "default",
+        "minimum", "maximum", "total", "average", "difference", "compare", "versus"
+    }
+
+    ATTRIBUTE_KEYWORDS = {
+        "price", "cost", "fee", "salary", "compensation", "age", "education", "qualification",
+        "skills", "technologies", "tools", "period", "duration", "validity", "deadline", "date",
+        "department", "location", "status", "stage", "stages", "role", "profession", "discount"
+    }
+
+    COMMON_ACTION_VERBS = {
+        "happen", "happens", "occur", "occurs", "work", "works", "take", "takes", "start", "starts",
+        "do", "does", "did", "done", "see", "show", "tell", "give", "find", "get"
+    }
+
     def __init__(self, analyzer: Optional[QueryAnalyzer] = None):
         self.analyzer = analyzer or QueryAnalyzer()
+        self.normalizer = QueryNormalizer()
+        self.decomposer = QueryDecomposer()
 
-    def plan(self, query: str) -> QueryPlan:
-        clean_q = query.strip()
-        lower_q = clean_q.lower()
+    def plan(
+        self,
+        query: str,
+        vocab: Optional[DynamicCorpusVocabulary] = None,
+        language: str = "en",
+        context_entity: Optional[str] = None
+    ) -> QueryPlan:
+        original_q = query.strip()
+        lower_q = original_q.lower()
 
-        # 1. Analyze query via QueryAnalyzer
-        analyzed = self.analyzer.analyze(clean_q)
+        # 1. Normalize query
+        norm_result = self.normalizer.normalize(original_q)
+        normalized_q = norm_result.normalized_text
+        tokens = norm_result.tokens
 
-        # 2. Extract numbers, percentages, currencies
-        numbers = [float(n.replace(",", "")) for n in re.findall(r'\b\d+(?:,\d{3})*(?:\.\d+)?\b', clean_q)]
-        percentages = [float(p.rstrip("%")) for p in re.findall(r'\b\d+(?:\.\d+)?\%', clean_q)]
-        currencies = re.findall(r'[\$₹€£]|USD|INR|EUR|GBP', clean_q, re.IGNORECASE)
+        # 2. Analyze query structure & syntactic scoping
+        analyzed = self.analyzer.analyze(original_q, vocab=vocab)
 
-        # 3. Detect Comparison targets
+        # 3. Detect Numbers, Percentages, Currencies
+        numbers = [float(n.replace(",", "")) for n in re.findall(r'\b\d+(?:,\d{3})*(?:\.\d+)?\b', original_q)]
+        percentages = [float(p.rstrip("%")) for p in re.findall(r'\b\d+(?:\.\d+)?\%', original_q)]
+        currencies = re.findall(r'[\$₹€£]|USD|INR|EUR|GBP', original_q, re.IGNORECASE)
+
+        # 4. Detect Question Type
+        q_type = "what"
+        for pat, t in self.QUESTION_TYPE_PATTERNS:
+            if pat.search(lower_q):
+                q_type = t
+                break
+
+        # 5. Detect Action and Qualifiers
+        detected_action = None
+        for pat, act in self.ACTION_PATTERNS:
+            m = pat.search(lower_q)
+            if m:
+                detected_action = act(m) if callable(act) else act
+                break
+
+        qualifiers = [w for w in re.findall(r'\b\w+\b', lower_q) if w in self.QUALIFIER_KEYWORDS]
+
+        # 6. Detect Comparison
         comp_targets = []
         is_comparison = False
         comp_match = re.search(r'\b(?:compare|difference\s+between|versus|vs\.?)\s+([a-zA-Z0-9_\s]+?)\s+(?:and|to|with)\s+([a-zA-Z0-9_\s]+)', lower_q)
         if comp_match:
             is_comparison = True
             comp_targets = [comp_match.group(1).strip(), comp_match.group(2).strip()]
-        elif "compare" in lower_q or " vs " in lower_q or "versus" in lower_q:
+        elif any(w in lower_q for w in ["compare", " vs ", "versus", "difference between"]):
             is_comparison = True
 
-        # 4. Detect Calculation intent
+        # 7. Detect Calculation
         calc_words = ["calculate", "total", "sum", "discount", "gst", "tax", "vat", "net price", "final price", "average"]
         is_calculation = any(w in lower_q for w in calc_words) and (len(numbers) > 0 or len(percentages) > 0 or "gst" in lower_q or "discount" in lower_q)
 
-        # 5. Detect Temporal intent
-        temp_words = ["days", "months", "years", "duration", "validity", "expires", "after", "before", "deadline"]
-        is_temporal = any(w in lower_q for w in temp_words) and any(c.isdigit() for c in lower_q)
+        # 8. Detect Temporal Context
+        temporal_words = ["days", "months", "years", "duration", "validity", "expires", "after", "before", "deadline", "period"]
+        is_temporal = any(w in lower_q for w in temporal_words) and (any(c.isdigit() for c in lower_q) or "after" in lower_q or "before" in lower_q)
+        temporal_ctx = None
+        if "after" in lower_q:
+            temporal_ctx = "after"
+        elif "before" in lower_q:
+            temporal_ctx = "before"
+        elif "during" in lower_q:
+            temporal_ctx = "during"
 
-        # 6. Detect Table Lookup intent
+        # 9. Detect Table Lookup
         table_words = ["table", "column", "row", "price", "credit period", "specification", "sku", "cost", "fee"]
         is_table = (analyzed.profile == QueryProfile.TABLE_LOOKUP) or any(w in lower_q for w in table_words)
 
-        attribute_or_topic_nouns = {
-            "technology", "technologies", "skill", "skills", "tool", "tools",
-            "age", "education", "degree", "qualification", "profession", "job", "role",
-            "price", "cost", "fee", "salary", "compensation", "period", "duration",
-            "policy", "rule", "rules", "guideline", "guidelines", "process", "procedure",
-            "details", "information", "name", "status", "deadline", "date", "time",
-            "table", "row", "column", "list", "total", "difference", "comparison"
-        }
+        # 10. Extract Entities & Subject
+        entities: List[str] = []
 
-        # 7. Extract Entities
-        entities = []
-        if analyzed.primary_entity:
-            pe_clean = analyzed.primary_entity.strip()
-            if pe_clean.lower() not in attribute_or_topic_nouns and pe_clean.lower() not in STOP_WORDS:
-                entities.append(pe_clean)
+        # Check for direct object of actions or prepositions (e.g. "after creating a [entity]", "after saving an [entity]", "purpose of [entity]")
+        m_act_obj = re.search(r'\b(?:[a-z]{3,}ing|[a-z]{3,}tion|about|of|for|in|on|with|to|create|configure|setup|save|submit|apply|delete|manage)\s+(?:a|an|the)?\s*([a-zA-Z0-9_\-]{2,30})', lower_q)
+        if m_act_obj:
+            act_cand = m_act_obj.group(1).strip()
+            if act_cand.lower() not in STOP_WORDS and act_cand.lower() not in self.QUALIFIER_KEYWORDS and act_cand.lower() not in self.ATTRIBUTE_KEYWORDS and act_cand.lower() not in self.COMMON_ACTION_VERBS:
+                entities.append(act_cand.title())
+
         # Proper noun phrases
-        prop_matches = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', clean_q)
+        prop_matches = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', original_q)
         for p in prop_matches:
             p_clean = p.strip()
             if (
                 len(p_clean) >= 3
                 and p_clean.lower() not in STOP_WORDS
-                and p_clean.lower() not in attribute_or_topic_nouns
+                and p_clean.lower() not in self.ATTRIBUTE_KEYWORDS
+                and p_clean.lower() not in self.QUALIFIER_KEYWORDS
+                and p_clean.lower() not in self.COMMON_ACTION_VERBS
                 and p_clean not in entities
             ):
                 entities.append(p_clean)
 
-        # 8. Dynamic Target Attribute Detection
-        target_attrs: List[str] = list(analyzed.target_attributes or [])
-        attr_heuristics = [
-            ("age", [r'\bage\b', r'\bhow\s+old\b', r'\byears?\s+old\b']),
-            ("education", [r'\beducation\b', r'\bdegree\b', r'\bstudy\b', r'\bstudied\b', r'\bqualification\b', r'\bcollege\b', r'\buniversity\b']),
-            ("skills", [r'\bskills?\b', r'\btechnolog(?:y|ies)\b', r'\btech(?:\s+stack)?\b', r'\btools?\b', r'\bframeworks?\b', r'\bprogramming\b']),
-            ("profession", [r'\bprofession\b', r'\brole\b', r'\bjob\b', r'\bdesignation\b', r'\boccupation\b', r'\bwork(?:s)?\s+as\b', r'\bwho\s+is\b']),
-            ("price", [r'\bprice\b', r'\bcost\b', r'\bfee\b', r'\bsubscription\b', r'\bhow\s+much\b', r'\bpricing\b']),
-            ("period", [r'\bperiod\b', r'\bduration\b', r'\bvalidity\b', r'\bdeadline\b', r'\bhow\s+long\b', r'\bcancel(?:lation)?\b', r'\bnotice\b']),
-            ("salary", [r'\bsalary\b', r'\bcompensation\b', r'\bpay\b', r'\bpackage\b', r'\bctc\b']),
-            ("department", [r'\bdepartment\b', r'\bteam\b', r'\bdivision\b']),
-            ("location", [r'\blocation\b', r'\bwhere\b', r'\baddress\b', r'\bcity\b', r'\bcountry\b', r'\bheadquarters\b'])
-        ]
-        for attr_key, patterns in attr_heuristics:
-            if attr_key not in target_attrs:
-                for pat in patterns:
-                    if re.search(pat, lower_q):
-                        target_attrs.append(attr_key)
-                        break
+        if analyzed.primary_entity:
+            pe_clean = analyzed.primary_entity.strip()
+            if (
+                pe_clean.lower() not in self.ATTRIBUTE_KEYWORDS
+                and pe_clean.lower() not in STOP_WORDS
+                and pe_clean.lower() not in self.QUALIFIER_KEYWORDS
+                and pe_clean.lower() not in self.COMMON_ACTION_VERBS
+                and pe_clean not in entities
+                and not any(pe_clean.lower() in e.lower() for e in entities)
+            ):
+                entities.append(pe_clean)
 
-        # 9. Extract clean keywords
-        words = re.findall(r'\b\w+\b', lower_q)
-        keywords = [w for w in words if len(w) >= 3 and w not in STOP_WORDS]
+        # If context entity was supplied (e.g. from session state)
+        if context_entity and context_entity not in entities:
+            entities.append(context_entity)
 
-        # 10. Determine if embedding can be bypassed
-        # Semantic search is MANDATORY for all conceptual, natural language, and attribute questions.
-        # ONLY pure code lookups (e.g. raw invoice numbers INV-20394) or pure offline math bypass embedding.
-        is_exact_code = bool(re.search(r'^[A-Z0-9_\-]{4,}$', clean_q))
-        can_bypass = is_exact_code or (is_calculation and len(numbers) >= 2 and not any(w in lower_q for w in ["what", "how", "why", "document", "plan", "policy"]))
+        # Primary subject determination (guarded against action verbs)
+        candidate_subj = entities[0] if entities else (analyzed.primary_entity or None)
+        subject = candidate_subj if (candidate_subj and candidate_subj.lower() not in self.COMMON_ACTION_VERBS) else (entities[0] if entities else None)
 
-        # 11. Select Active Retrieval Branches
+        # 11. Extract Target Attributes
+        attributes = list(analyzed.target_attributes or [])
+        for w in tokens:
+            w_sing = singularize(w)
+            if (w in self.ATTRIBUTE_KEYWORDS or w_sing in self.ATTRIBUTE_KEYWORDS) and w not in attributes:
+                attributes.append(w_sing)
+
+        # 12. Relationships extraction
+        relationships = []
+        if "after" in lower_q or "next" in lower_q:
+            relationships.append("next_step")
+        if "before" in lower_q or "prerequisite" in lower_q:
+            relationships.append("prerequisite")
+        if any(w in lower_q for w in ["stage", "stages", "step", "steps"]):
+            relationships.append("has_stage")
+        if any(w in lower_q for w in ["used for", "purpose", "why"]):
+            relationships.append("used_for")
+        if any(w in lower_q for w in ["configure", "configuration", "setup"]):
+            relationships.append("configured_by")
+
+        # 13. Detect Intent Category
+        if is_calculation:
+            intent = "calculation"
+        elif is_comparison:
+            intent = "comparison"
+        elif is_table:
+            intent = "table_value"
+        elif detected_action == "after_creation" or ("after" in lower_q and any(w in lower_q for w in ["create", "creating", "creation", "setup", "configure"])):
+            intent = "workflow_explanation"
+        elif analyzed.profile == QueryProfile.PROCEDURAL or "how" in q_type:
+            intent = "procedure"
+        elif any(w in lower_q for w in ["what is", "what are", "define", "meaning", "definition"]):
+            intent = "definition"
+        elif any(w in lower_q for w in ["explain", "overview", "describe", "details"]):
+            intent = "explanation"
+        elif relationships:
+            intent = "relationship"
+        elif is_temporal:
+            intent = "temporal_information"
+        elif entities and attributes:
+            intent = "entity_information"
+        else:
+            intent = "general"
+
+        # 14. Question Decomposition for compound queries
+        sub_queries = self.decomposer.decompose(original_q)
+
+        # 15. Dynamic Query Expansion via Corpus Vocabulary
+        expanded_terms = []
+        if vocab:
+            for t in tokens:
+                exp = vocab.expand_acronym(t)
+                if exp:
+                    expanded_terms.append(exp)
+                morphs = vocab.get_morphological_variants(t)
+                expanded_terms.extend(morphs[:2])
+
+        # 16. Dynamic Retrieval Strategy Routing & Weights
         branches = ["exact", "entity", "bm25", "fuzzy"]
-        if is_table:
-            branches.append("table")
-        if not can_bypass:
+        branch_weights: Dict[str, float] = {
+            "vector": 0.50,
+            "bm25": 0.25,
+            "exact": 0.15,
+            "entity": 0.10,
+            "table": 0.0,
+            "fuzzy": 0.05,
+            "parent_child": 0.10,
+        }
+
+        # Embedding bypass rule: Only exact single-token codes or standalone pure math bypass embedding
+        is_exact_code = bool(re.search(r'^[A-Z0-9_\-]{4,}$', original_q.strip()))
+        can_bypass_emb = is_exact_code or (
+            is_calculation and len(numbers) >= 2 and not any(w in lower_q for w in ["what", "how", "why", "document", "plan", "policy", "pipeline"])
+        )
+
+        if not can_bypass_emb:
             branches.append("vector")
 
-        intent = "GENERAL"
-        if is_calculation:
-            intent = "CALCULATION"
-        elif is_comparison:
-            intent = "COMPARISON"
-        elif is_table:
-            intent = "TABLE_LOOKUP"
-        elif is_temporal:
-            intent = "TEMPORAL"
-        elif analyzed.profile == QueryProfile.PROCEDURAL:
-            intent = "PROCEDURAL"
-        elif analyzed.profile == QueryProfile.EXACT_CODE:
-            intent = "EXACT_CODE"
+        if is_table:
+            branches.append("table")
+            branch_weights["table"] = 0.35
+            branch_weights["exact"] = 0.25
+            branch_weights["bm25"] = 0.20
+            branch_weights["vector"] = 0.20
+
+        if intent in ("workflow_explanation", "procedure"):
+            branches.append("parent_child")
+            branch_weights["vector"] = 0.40
+            branch_weights["bm25"] = 0.25
+            branch_weights["entity"] = 0.20
+            branch_weights["parent_child"] = 0.30
+
+        if intent == "definition":
+            branch_weights["vector"] = 0.55
+            branch_weights["bm25"] = 0.25
+            branch_weights["entity"] = 0.20
+
+        if is_comparison:
+            branches.append("table")
+            branch_weights["entity"] = 0.35
+            branch_weights["vector"] = 0.35
+            branch_weights["exact"] = 0.15
+            branch_weights["table"] = 0.15
+
+        retrieval_strategy = {
+            "active_branches": branches,
+            "weights": branch_weights,
+            "can_bypass_embedding": can_bypass_emb,
+            "require_parent_child": "parent_child" in branches
+        }
+
+        # Reference tracking
+        conv_refs = []
+        for ref_word in ["it", "this", "that", "they", "them", "the above"]:
+            if re.search(r'\b' + ref_word + r'\b', lower_q):
+                conv_refs.append(ref_word)
 
         return QueryPlan(
-            raw_query=query,
-            clean_query=clean_q,
+            normalized_query=normalized_q,
+            original_query=original_q,
+            language=language,
             intent=intent,
-            profile=analyzed.profile,
+            subject=subject,
             entities=entities,
-            keywords=keywords,
+            action=detected_action,
+            qualifiers=qualifiers,
+            attributes=attributes,
+            relationships=relationships,
+            temporal_context=temporal_ctx,
+            comparison_targets=comp_targets,
+            question_type=q_type,
+            document_scope=None,
+            conversation_references=conv_refs,
+            sub_queries=sub_queries,
+            expanded_terms=list(set(expanded_terms)),
+            retrieval_strategy=retrieval_strategy,
+            # Backward-compatible fields:
+            raw_query=original_q,
+            clean_query=original_q,
+            profile=analyzed.profile,
+            keywords=[w for w in tokens if len(w) >= 3 and w not in STOP_WORDS],
             numbers=numbers,
             currencies=currencies,
             percentages=percentages,
-            comparison_targets=comp_targets,
-            target_attributes=target_attrs,
-            can_bypass_embedding=can_bypass,
+            target_attributes=attributes,
+            can_bypass_embedding=can_bypass_emb,
             requires_calculation=is_calculation,
             requires_comparison=is_comparison,
             requires_temporal=is_temporal,

@@ -10,6 +10,8 @@ class QueryProfile(str, Enum):
     TABLE_LOOKUP = "TABLE_LOOKUP"               # Pricing, specs, attributes, quantities, comparisons
     MULTI_PART = "MULTI_PART"                   # Compound questions with multiple distinct queries
     CONCEPTUAL_PARAPHRASE = "CONCEPTUAL"       # Explanatory, definitional, policies, natural questions
+    WORKFLOW = "WORKFLOW"                       # Sequential operations, lifecycle stages, after-creation steps
+    RELATIONSHIP = "RELATIONSHIP"               # Structure, prerequisites, containment, dependencies
 
 class AnalyzedQuery:
     """Structured container for deep deterministic query intelligence."""
@@ -193,17 +195,25 @@ class QueryAnalyzer:
             if re.match(r'^[A-Z]{2,}\-[0-9]+', t_clean):
                 return QueryProfile.EXACT_CODE
 
-        # 3. Procedural
+        # 3. Workflow / Lifecycle steps
+        if re.search(r'\b(?:after\s+(?:creating|creation|setting\s+up|configuring|saving)|what\s+happens\s+after|next\s+steps?|workflow\s+of|lifecycle)\b', q_lower):
+            return QueryProfile.WORKFLOW
+
+        # 4. Procedural
         for p in self.PROCEDURAL_PATTERNS:
             if re.search(p, q_lower):
                 return QueryProfile.PROCEDURAL
 
-        # 4. Table / Attribute Lookup
+        # 5. Table / Attribute Lookup
         for p in self.TABLE_PATTERNS:
             if re.search(p, q_lower):
                 return QueryProfile.TABLE_LOOKUP
 
-        # 5. Default to Conceptual Paraphrase
+        # 6. Relationship / Structure
+        if re.search(r'\b(?:composed\s+of|consists\s+of|contains|has\s+stages?|prerequisites?|depends\s+on)\b', q_lower):
+            return QueryProfile.RELATIONSHIP
+
+        # 7. Default to Conceptual Paraphrase
         return QueryProfile.CONCEPTUAL_PARAPHRASE
 
     def analyze(self, query: str, vocab: Optional[DynamicCorpusVocabulary] = None) -> AnalyzedQuery:

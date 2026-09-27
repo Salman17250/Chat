@@ -12,6 +12,8 @@ from app.rag.retrieval.exact_search import ExactSearchEngine
 from app.rag.retrieval.entity_search import EntitySearchEngine
 from app.rag.retrieval.table_search import TableSearchEngine
 from app.rag.vocabulary.dynamic_vocabulary import DynamicCorpusVocabulary
+from app.rag.knowledge.entity_graph import EntityGraph
+from app.rag.knowledge.relationship_graph import RelationshipGraph
 
 TENANTS_DIR = DATA_DIR / "tenants"
 
@@ -45,6 +47,8 @@ class TenantIndex:
         self.entity_engine = EntitySearchEngine()
         self.table_engine = TableSearchEngine()
         self.dynamic_vocab = DynamicCorpusVocabulary()
+        self.entity_graph = EntityGraph()
+        self.relationship_graph = RelationshipGraph()
         self.thresholds = dict(DEFAULT_CALIBRATED_THRESHOLDS)
 
     def load(self):
@@ -117,6 +121,8 @@ class TenantIndex:
                 self.entity_engine.index_chunks(self.chunks)
                 self.table_engine.index_chunks(self.chunks)
                 self.dynamic_vocab.build_from_chunks(self.chunks)
+                self.entity_graph.build_from_chunks(self.chunks)
+                self.relationship_graph.build_from_chunks(self.chunks, self.entity_graph)
 
                 print(f"[TenantIndex:{self.tenant_id}] Loaded {len(self.chunks)} chunks across {len(self.documents)} documents from Neon Cloud PostgreSQL (100% in RAM).")
                 return
@@ -137,6 +143,8 @@ class TenantIndex:
                 self.exact_engine.index_chunks([])
                 self.entity_engine.index_chunks([])
                 self.table_engine.index_chunks([])
+                self.entity_graph.clear()
+                self.relationship_graph.clear()
                 return
         except Exception as e:
             print(f"[TenantIndex:{self.tenant_id}] Cloud database notice: {e}. Purging all runtime data.")
@@ -155,6 +163,8 @@ class TenantIndex:
             self.exact_engine.index_chunks([])
             self.entity_engine.index_chunks([])
             self.table_engine.index_chunks([])
+            self.entity_graph.clear()
+            self.relationship_graph.clear()
             return
 
     def save(self):
@@ -206,6 +216,8 @@ class TenantIndex:
         self.entity_engine.index_chunks(self.chunks)
         self.table_engine.index_chunks(self.chunks)
         self.dynamic_vocab.build_from_chunks(self.chunks)
+        self.entity_graph.build_from_chunks(self.chunks)
+        self.relationship_graph.build_from_chunks(self.chunks, self.entity_graph)
 
     def delete_document(self, identifier: str) -> bool:
         """

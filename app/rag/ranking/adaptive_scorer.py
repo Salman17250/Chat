@@ -51,6 +51,12 @@ class AdaptiveScorer:
         },
         QueryProfile.MULTI_PART: {
             "sem": 0.45, "kw": 0.25, "phrase": 0.10, "fuzz": 0.05, "head": 0.10, "intent": 0.03, "meta": 0.02
+        },
+        QueryProfile.WORKFLOW: {
+            "sem": 0.40, "kw": 0.20, "phrase": 0.15, "fuzz": 0.03, "head": 0.12, "intent": 0.08, "meta": 0.02
+        },
+        QueryProfile.RELATIONSHIP: {
+            "sem": 0.40, "kw": 0.20, "phrase": 0.15, "fuzz": 0.03, "head": 0.12, "intent": 0.07, "meta": 0.03
         }
     }
 
